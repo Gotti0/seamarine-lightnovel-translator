@@ -213,8 +213,12 @@ class Epub:
         else:
             return self.get_language()
     
+    def get_title(self) -> str:
+        return self._title.text
+
     def update_title(self, new_title: str):
-        self._metadata.set(f"{{{self._ns["dc"]}}}language", new_title)
+        self._title.text = new_title
+
 
     def update_read_direction(self, direction: str = "ltr"):
         opf_tree, self._opf_path = self._get_opf_tree_and_path()

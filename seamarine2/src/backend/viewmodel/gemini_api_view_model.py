@@ -18,7 +18,7 @@ class GeminiApiViewModel(QObject):
             self.is_checking: bool = False
             self.is_api_key_invalid: bool = False
             self.is_problem_occured: bool = False
-            self._temp_api_key: str = ""
+            self._temp_api_keys: list[str] = []
             self.logger.info(str(self) + ".__init__")
         except Exception as e:
             self.logger.error(str(self) + str(e))
@@ -39,16 +39,17 @@ class GeminiApiViewModel(QObject):
         return self.is_problem_occured
     
     @Slot(str)
-    def run_next_button_action(self, api_key: str):
+    def run_next_button_action(self, api_keys_str: str):
         try:
-            self._temp_api_key = api_key
-            self.model_list_retriever = GeminiModelListRetriever(self._app_controller.translate_core, api_key)
+            api_keys = [key.strip() for key in api_keys_str.splitlines() if key.strip()]
+            self._temp_api_keys = api_keys
+            self.model_list_retriever = GeminiModelListRetriever(self._app_controller.translate_core, api_keys)
             self.model_list_retriever.retrieved.connect(self.process_check_result)
             self.model_list_retriever.finished.connect(self.model_list_retriever.quit)
             self.model_list_retriever.start()
             self.is_checking = True
             self.isCheckingChanged.emit()
-            self.logger.info(str(self) + f".run_next_button_action({api_key})")
+            self.logger.info(str(self) + f".run_next_button_action(api_keys_str='{api_keys_str}')")
         except Exception as e:
             self.logger.error(str(self) + str(e))
     
@@ -80,8 +81,8 @@ class GeminiApiViewModel(QObject):
                 self.isApiKeyInvalidChanged.emit()
                 self.is_problem_occured = False
                 self.isProblemOccuredChanged.emit()
-                self._config_data.gemini_api_key = self._temp_api_key
-                self._temp_api_key = ""
+                self._config_data.gemini_api_keys = self._temp_api_keys
+                self._temp_api_keys = []
                 save_config(self._config_data.to_dict())
                 self._runtime_data.gemini_model_list = result
                 self._app_controller.popLeftCurrentPage.emit()

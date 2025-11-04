@@ -200,7 +200,7 @@ Before you finalize your response, double-check that the entire output is a sing
                 if len(translated_lines) != len(chunk) or re.sub(r'^\[\d+\]\s*', '', translated_lines[-1]).strip() == "":
                     self._logger.info(
                         f"Failed To Parse Translated Response Of Chunk{chunk_index} (Try {i+1})\n" + \
-                        f"len(loaded_lines)={len(translated_lines)}, len(chunk)={len(chunk)} {re.sub(r'^\[\d+\]\s*', '', translated_lines[-1] if translated_lines else "No line found").strip()}"
+                        "len(loaded_lines)={}, len(chunk)={} {}".format(len(translated_lines), len(chunk), re.sub(r'^[\d+]\s*', '', translated_lines[-1] if translated_lines else "No line found").strip())
                         )
                     if i == 2:
                         self._logger.warning(f"Final Failiure In Chunk{chunk_index} Translation")

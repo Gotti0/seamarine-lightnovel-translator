@@ -134,43 +134,26 @@ Page {
             Layout.fillWidth: true
             Layout.alignment: Qt.AlignHCenter
             
-            text: qsTr("현재 API KEY: %1").arg(geminiApiResetViewModel.geminiApiKey)
-            font.family: root.pageFont.family
-            font.pixelSize: 12
-            horizontalAlignment: Text.AlignHCenter
-            color: colorLoader.shimarin_dark
+            text: qsTr("현재 API KEY: %1").arg(geminiApiResetViewModel.geminiApiKeys.join('\n'))
         }
-        TextField {
-            id: geminiApiTextField
+        TextArea {
+            id: geminiApiTextArea
             Layout.preferredWidth: 288
-            Layout.preferredHeight: 32
+            Layout.preferredHeight: 100
             Layout.alignment: Qt.AlignHCenter
             font.pixelSize: 12
             color: colorLoader.shimarin_dark
-            leftPadding: 10
-            rightPadding: 10
+            padding: 10
 
             background: Rectangle {
-                id: geminiApiTextFieldBackground
-                width: 288
-                height: 32
                 radius: 16
                 color: "white"
                 border.color: colorLoader.shimarin_dark
                 border.width: 3
             }
-            Text {
-                id: customPlaceholder
-                anchors.fill: parent
-                verticalAlignment: Text.AlignVCenter
-                horizontalAlignment: Text.AlignHCenter
-                text: qsTr("여기에 Gemini API Key를 입력하세요.")
-                font.family: root.pageFont.family
-                font.pixelSize: 12
-                color: "grey"
 
-                visible: geminiApiTextField.text.length === 0
-            }
+            placeholderText: qsTr("여기에 Gemini API Key를 입력하세요. 여러 개라면 한 줄에 하나씩 입력해주세요.")
+            placeholderTextColor: "grey"
         }
 
         Text {
@@ -235,7 +218,7 @@ Page {
             Layout.preferredHeight: 80
             Layout.alignment: Qt.AlignHCenter
 
-            onClicked: geminiApiResetViewModel.run_next_button_action(geminiApiTextField.text)
+            onClicked: geminiApiResetViewModel.run_next_button_action(geminiApiTextArea.text)
         }
 
         Text {

@@ -27,13 +27,13 @@ class StartViewModel(QObject):
         if self.is_processing:
             return
         try:
-            if self._config_data.gemini_api_key == '':
+            if not self._config_data.gemini_api_keys:
                 self._app_controller.popLeftCurrentPage.emit()
                 self._app_controller.navigateToGeminiApiPage.emit()
             else:
                 self.is_processing = True
                 self.isProcessingChanged.emit()
-                self.gemini_model_list_retirever = GeminiModelListRetriever(self._app_controller.translate_core, self._config_data.gemini_api_key)
+                self.gemini_model_list_retirever = GeminiModelListRetriever(self._app_controller.translate_core, self._config_data.gemini_api_keys)
                 self.gemini_model_list_retirever.retrieved.connect(self.update_model_list)
                 self.gemini_model_list_retirever.finished.connect(self.move_next)
                 self.gemini_model_list_retirever.finished.connect(self.gemini_model_list_retirever.quit)

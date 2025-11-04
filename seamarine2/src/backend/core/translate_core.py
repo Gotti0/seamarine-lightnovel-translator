@@ -14,21 +14,26 @@ class TranslateCore:
         self._logger = logging.getLogger("seamarine_translate")
         try:
             self.language_from = language_from
-            self._key: str = ""
-            self._client = None if self._key == "" else genai.Client()
+            self._keys: list[str] = []
+            self._current_key_index: int = 0
+            self._client = None
             self._model_data: AiModelConfig
             self._logger.info(str(self) + ".__init__")
         except Exception as e:
             self._logger.error(str(self) + str(e))
         
-    def register_key(self, key: str) -> bool: 
+    def register_keys(self, keys: list[str]) -> bool: 
         try:
-            os.environ['GOOGLE_API_KEY'] = key
+            self._keys = keys
+            if not self._keys:
+                return False
+            
+            os.environ['GOOGLE_API_KEY'] = self._keys[0]
             self._client = genai.Client()
-            self._logger.info(str(self) + f".register_key({key})")
+            self._logger.info(str(self) + f".register_keys(len(keys)={len(keys)})")
             return True
         except Exception as e:
-            self._logger.error(str(self) + f".register_key({key})\n-> " + str(e))
+            self._logger.error(str(self) + f".register_keys(len(keys)={len(keys)})\n-> " + str(e))
             return False
         
     def update_model_data(self, data: AiModelConfig) -> bool:
@@ -55,7 +60,18 @@ class TranslateCore:
             self._logger.error(str(self) + str(e))
             return []
         
-    def generate_content(self, contents: str | bytes, divide_n_conquer = True, resp_in_json = False):
+    def _rotate_key(self) -> bool:
+        if not self._keys:
+            return False
+        
+        self._current_key_index = (self._current_key_index + 1) % len(self._keys)
+        new_key = self._keys[self._current_key_index]
+        os.environ['GOOGLE_API_KEY'] = new_key
+        self._client = genai.Client()
+        self._logger.info(f"Rotated to key index {self._current_key_index}")
+        return True
+
+    def generate_content(self, contents: str | bytes, divide_n_conquer = True, resp_in_json = False, level: int = 0, retry_count: int = 0):
         try:
             gen_config = types.GenerateContentConfig(
                 max_output_tokens= 65536 if '2.5' in self._model_data.name else 8192,
@@ -98,53 +114,33 @@ class TranslateCore:
             if resp.prompt_feedback and resp.prompt_feedback.block_reason:
                 self._logger.warning(f"Response blocked with the reason {resp.prompt_feedback.block_reason}")
                 if divide_n_conquer:
-                    return self._divide_and_conquer_json(contents) if resp_in_json else self._divide_and_conquer(contents)
+                    return self._divide_and_conquer_json(contents, level=level) if resp_in_json else self._divide_and_conquer(contents, level=level)
                 else:
                     return ""
             return self._clean_gemini_response(resp.text)
         except Exception as e:
             self._logger.error(f"{str(self)}.generate_content -> {str(e)}")
-            if "429" in str(e) or "Resource exhausted" in str(e):
-                dynamic_delay = self._get_retry_delay_from_exception(str(e))
-                self._logger.info(str(self) + f".process_chunk\n-> 429/Resource Exhausted Detected. Retry after {dynamic_delay} seconds")
-                time.sleep(dynamic_delay)
-                return self.generate_content(contents)
+            if ("429" in str(e) or "Resource exhausted" in str(e)) and retry_count < len(self._keys):
+                self._logger.info(f"429/Resource Exhausted Detected. Rotating API key.")
+                self._rotate_key()
+                return self.generate_content(contents, divide_n_conquer, resp_in_json, level, retry_count + 1)
             else:
                 return ""
         
     def count_token(self, text):
         return self._client.models.count_tokens(text)
     
-    def _get_retry_delay_from_exception(self, error_str: str, extra_seconds: int = 5) -> int:
-        start_idx = error_str.find('{')
-        if start_idx == -1:
-            return 0 
-        
-        dict_str = error_str[start_idx:]
-        retry_seconds = 0
 
-        try:
-            err_data = ast.literal_eval(dict_str)
-            details = err_data.get("error", {}).get("details", [])
-            for detail in details:
-                if detail.get("@type") == "type.googleapis.com/google.rpc.RetryInfo":
-                    retry_str = detail.get("retryDelay", "")
-                    match = re.match(r"(\d+)s", retry_str)
-                    if match:
-                        retry_seconds = int(match.group(1))
-                        break
-        except Exception as e:
-            self._logger.warning(f"Failed to parse retryDelay: {e}")
-            return 10
-
-        return retry_seconds + extra_seconds if retry_seconds > 0 else 0
-
-    def _divide_and_conquer_json(self, contents: str) -> str:
+    def _divide_and_conquer_json(self, contents: str, level: int = 0) -> str:
+        self._logger.info(f"Start divide and conquer in json at level {level}")
         json_dict = json.loads(contents)
         keys = list(json_dict.keys())
         mid = len(keys) // 2
         first_half = {k: json_dict[k] for k in keys[:mid]}
         second_half = {k: json_dict[k] for k in keys[mid:]}
+
+        self._logger.debug(f"First half: {first_half}")
+        self._logger.debug(f"Second half: {second_half}")
 
         subcontents_1 = json.dumps(first_half)
         subcontents_2 = json.dumps(second_half)
@@ -153,15 +149,21 @@ class TranslateCore:
         subdict_2 = {}
         for i in range(3):
             try:
-                subresp_1 = self.generate_content(subcontents_1, resp_in_json=True)
+                self._logger.info(f"Processing first half... (level {level + 1}, chunk 1, attempt {i})")
+                subresp_1 = self.generate_content(subcontents_1, resp_in_json=True, level=level+1, retry_count=0)
                 subdict_1.update(json.loads(subresp_1))
+                self._logger.debug(f"Response from first half: {subresp_1}")
+                break
             except Exception as e:
                 self._logger.exception(f"Failed to divide and conquer in json, retry...({i})")
                 continue
         for i in range(3):
             try:
-                subresp_2 = self.generate_content(subcontents_2, resp_in_json=True)
+                self._logger.info(f"Processing second half... (level {level + 1}, chunk 2, attempt {i})")
+                subresp_2 = self.generate_content(subcontents_2, resp_in_json=True, level=level+1, retry_count=0)
                 subdict_2.update(json.loads(subresp_2))
+                self._logger.debug(f"Response from second half: {subresp_2}")
+                break
             except Exception as e:
                 self._logger.exception(f"Failed to divide and conquer in json, retry...({i})")
                 continue
@@ -170,10 +172,13 @@ class TranslateCore:
         merged_dict = {}
         merged_dict.update(subdict_1)
         merged_dict.update(subdict_2)
+        self._logger.debug(f"Merged dict: {merged_dict}")
 
+        self._logger.info(f"End divide and conquer in json at level {level}")
         return json.dumps(merged_dict)
     
-    def _divide_and_conquer(self, contents: str) -> str:
+    def _divide_and_conquer(self, contents: str, level: int = 0) -> str:
+        self._logger.info(f"Start divide and conquer at level {level}")
         subcontents_1 = contents[0:len(contents)//2]
         subcontents_2 = contents[len(contents)//2:len(contents)]
 

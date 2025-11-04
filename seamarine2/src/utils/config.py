@@ -6,7 +6,7 @@ CURRENT_VERSION = "2.1.0"
 
 _default_config_data: dict = {
     "current_version": CURRENT_VERSION,
-    "gemini_api_key": "",
+    "gemini_api_keys": [],
     "translate_pipeline": [
         "ruby removal", 
         "pn extract",

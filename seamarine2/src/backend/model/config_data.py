@@ -4,7 +4,7 @@ class ConfigData:
     def __init__(self):
         self.version: str = ''
         self.data: dict = {}
-        self.gemini_api_key: str = ''
+        self.gemini_api_keys: list[str] = []
         self.translate_pipeline: list[str] = ["ruby removal", "main translation", "review"]
         self.max_chunk_size: int = 4096
         self.max_concurrent_request: int = 1
@@ -18,7 +18,7 @@ class ConfigData:
     def load(self, data: dict):
         self.data = data
         self.version = self.data.get('current_version', '')
-        self.gemini_api_key = self.data.get('gemini_api_key', '')
+        self.gemini_api_keys = self.data.get('gemini_api_keys', [])
         self.translate_pipeline = self.data.get('translate_pipeline', ["ruby removal", "main translation", "review"])
         self.max_chunk_size = self.data.get('max_chunk_size', 4096)
         self.max_concurrent_request = self.data.get('max_concurrent_request', 1)
@@ -32,7 +32,7 @@ class ConfigData:
     def to_dict(self):
         return {
             'current_version': self.version,
-            'gemini_api_key': self.gemini_api_key,
+            'gemini_api_keys': self.gemini_api_keys,
             'translate_pipeline': self.translate_pipeline,
             'max_chunk_size': self.max_chunk_size,
             'max_concurrent_request': self.max_concurrent_request,

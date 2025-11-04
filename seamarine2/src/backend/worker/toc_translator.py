@@ -221,10 +221,10 @@ Before you finalize your response, double-check that the entire output is a sing
                     data[i].translated = re.sub(r'^\[\d+\]\s*', '', line).strip()
                 self._logger.info(f"Successfully Loaded Data From {save_path}")
                 return is_suceed
-            self._logger.info(f"""
+            self._logger.info("""
                 Failed To Load Data:
-                len(loaded_lines)={len(loaded_lines)}, len(data)={len(data)} {re.sub(r'^\[\d+\]\s*', '', loaded_lines[-1] if loaded_lines else "No line found").strip()}
-                """.strip())
+                len(loaded_lines)={}, len(data)={} {}
+                """.strip().format(len(loaded_lines), len(data), re.sub(r'^[\d+]\s*', '', loaded_lines[-1] if loaded_lines else "No line found").strip()))
         
             os.remove(save_path)
         
@@ -243,7 +243,7 @@ Before you finalize your response, double-check that the entire output is a sing
                 if len(translated_lines) != len(data) or re.sub(r'^\[\d+\]\s*', '', translated_lines[-1]).strip() == "":
                     self._logger.info(
                         f"Failed To Parse Translated Response (Try {i+1})\n" + \
-                        f"len(loaded_lines)={len(translated_lines)}, len(data)={len(data)} {re.sub(r'^\[\d+\]\s*', '', translated_lines[-1] if translated_lines else "No line found").strip()}"
+                        "len(loaded_lines)={}, len(data)={} {}".format(len(translated_lines), len(data), re.sub(r'^[\d+]\s*', '', translated_lines[-1] if translated_lines else "No line found").strip())
                         )
                     if i == 2:
                         self._logger.warning(f"Final Failiure In Translation")
