@@ -71,7 +71,7 @@ class TranslateCore:
         self._logger.info(f"Rotated to key index {self._current_key_index}")
         return True
 
-    def generate_content(self, contents: str | bytes, divide_n_conquer = True, resp_in_json = False, level: int = 0, retry_count: int = 0):
+    def generate_content(self, contents: str | bytes, divide_n_conquer = True, resp_in_json = False, level: int = 0, retry_count: int = 0, schema: dict = None):
         try:
             gen_config = types.GenerateContentConfig(
                 max_output_tokens= 65536 if '2.5' in self._model_data.name else 8192,
@@ -103,7 +103,11 @@ class TranslateCore:
                 ],
             )
             if self._model_data.use_thinking_budget:
-                gen_config.thinking_config = types.ThinkingConfig(thinking_budget=self._model_data.thinking_budget)
+                gen_config["thinking_config"] = types.ThinkingConfig(thinking_budget=self._model_data.thinking_budget)
+
+            if resp_in_json and schema:
+                gen_config["response_mime_type"] = "application/json"
+                gen_config["response_json_schema"] = schema
             
             resp = self._client.models.generate_content(
                 model=self._model_data.name,
@@ -114,7 +118,7 @@ class TranslateCore:
             if resp.prompt_feedback and resp.prompt_feedback.block_reason:
                 self._logger.warning(f"Response blocked with the reason {resp.prompt_feedback.block_reason}")
                 if divide_n_conquer:
-                    return self._divide_and_conquer_json(contents, level=level) if resp_in_json else self._divide_and_conquer(contents, level=level)
+                    return self._divide_and_conquer_json(contents, level=level, schema=schema) if resp_in_json else self._divide_and_conquer(contents, level=level)
                 else:
                     return ""
             return self._clean_gemini_response(resp.text)
@@ -131,7 +135,7 @@ class TranslateCore:
         return self._client.models.count_tokens(text)
     
 
-    def _divide_and_conquer_json(self, contents: str, level: int = 0) -> str:
+    def _divide_and_conquer_json(self, contents: str, level: int = 0, schema: dict = None) -> str:
         self._logger.info(f"Start divide and conquer in json at level {level}")
         json_dict = json.loads(contents)
         keys = list(json_dict.keys())
@@ -145,12 +149,30 @@ class TranslateCore:
         subcontents_1 = json.dumps(first_half)
         subcontents_2 = json.dumps(second_half)
 
+        schema1, schema2 = None, None
+        if schema and "properties" in schema:
+            try:
+                schema1 = {
+                    "type": "object",
+                    "properties": {k: schema["properties"][k] for k in first_half.keys()},
+                    "required": [str(k) for k in first_half.keys()]
+                }
+                schema2 = {
+                    "type": "object",
+                    "properties": {k: schema["properties"][k] for k in second_half.keys()},
+                    "required": [str(k) for k in second_half.keys()]
+                }
+            except KeyError as e:
+                self._logger.warning(f"Failed to create sub-schema due to KeyError: {e}. Proceeding without schema.")
+                schema1, schema2 = None, None
+
+
         subdict_1 = {}
         subdict_2 = {}
         for i in range(3):
             try:
                 self._logger.info(f"Processing first half... (level {level + 1}, chunk 1, attempt {i})")
-                subresp_1 = self.generate_content(subcontents_1, resp_in_json=True, level=level+1, retry_count=0)
+                subresp_1 = self.generate_content(subcontents_1, resp_in_json=True, level=level+1, retry_count=0, schema=schema1)
                 subdict_1.update(json.loads(subresp_1))
                 self._logger.debug(f"Response from first half: {subresp_1}")
                 break
@@ -160,7 +182,7 @@ class TranslateCore:
         for i in range(3):
             try:
                 self._logger.info(f"Processing second half... (level {level + 1}, chunk 2, attempt {i})")
-                subresp_2 = self.generate_content(subcontents_2, resp_in_json=True, level=level+1, retry_count=0)
+                subresp_2 = self.generate_content(subcontents_2, resp_in_json=True, level=level+1, retry_count=0, schema=schema2)
                 subdict_2.update(json.loads(subresp_2))
                 self._logger.debug(f"Response from second half: {subresp_2}")
                 break

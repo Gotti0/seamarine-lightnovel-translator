@@ -200,18 +200,20 @@ Before you finalize your response, double-check that the entire output is a sing
         llm_contents = json.dumps(chunk, ensure_ascii=False, indent=2)
         self._logger.info(f"Load Gemini Contents")
 
+        schema = {
+            "type": "object",
+            "properties": {
+                str(key): {"type": "string"} for key in chunk.keys()
+            },
+            "required": [str(key) for key in chunk.keys()]
+        }
+
         for i in range(3):
+            resp = ""
             try:
                 self._logger.info(f"Chunk{chunk_index} Translation (Try {i+1})")
-                resp = self._core.generate_content(llm_contents, resp_in_json=True)
+                resp = self._core.generate_content(llm_contents, resp_in_json=True, schema=schema)
                 translated_text_dict: dict = json.loads(resp)
-                if translated_text_dict.keys() != chunk.keys():
-                    self._logger.info(f"Failed To Parse Translated Response Of Chunk{chunk_index} (Try {i+1})\n")
-                    self._logger.info(f"##### ORIGINAL #####\n\n{str(llm_contents)}\n\n##### RESPONSE #####\n\n{str(resp)}\n")
-                    if i == 2:
-                        self._logger.warning(f"Final Failiure In Chunk{chunk_index} Translation")
-                        is_suceed = False
-                    continue
                 self._logger.info(f"Updated Chunks[{chunk_index}] Data")
                 time.sleep(self._request_delay)
                 return is_suceed, chunk_index, translated_text_dict
