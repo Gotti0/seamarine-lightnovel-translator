@@ -103,11 +103,11 @@ class TranslateCore:
                 ],
             )
             if self._model_data.use_thinking_budget:
-                gen_config["thinking_config"] = types.ThinkingConfig(thinking_budget=self._model_data.thinking_budget)
+                gen_config.thinking_config = types.ThinkingConfig(thinking_budget=self._model_data.thinking_budget)
 
             if resp_in_json and schema:
-                gen_config["response_mime_type"] = "application/json"
-                gen_config["response_json_schema"] = schema
+                gen_config.response_mime_type = "application/json"
+                gen_config.response_json_schema = schema
             
             resp = self._client.models.generate_content(
                 model=self._model_data.name,
