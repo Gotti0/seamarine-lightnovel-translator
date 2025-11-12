@@ -352,9 +352,9 @@ Before you finalize your response, double-check that the entire output is a sing
                         break
         except Exception as e:
             self._logger.warning(f"retryDelay 파싱 실패: {e}")
-            return 10
+            return 0
 
-        return retry_seconds + extra_seconds if retry_seconds > 0 else 10
+        return retry_seconds + extra_seconds if retry_seconds > 0 else 0
     
     def _calculate_backoff_delay(self, backoff_attempt: int, error_str: str = "") -> int:
         """
@@ -378,8 +378,17 @@ Before you finalize your response, double-check that the entire output is a sing
                 self._logger.info(f"Using API retryDelay: {api_delay}s")
                 return api_delay
         
-        # 지수 백오프: request_delay * (2 ^ attempt)
-        delay = self._request_delay * (2 ** backoff_attempt)
+        # API에서 retryDelay가 없으면 request_delay 기반 지수 백오프 사용
+        if self._request_delay > 0:
+            # 지수 백오프: request_delay * (2 ^ attempt)
+            delay = self._request_delay * (2 ** backoff_attempt)
+            # 최대 300초(5분)로 제한
+            delay = min(delay, 300)
+            self._logger.info(f"Using exponential backoff: {delay}s (request_delay={self._request_delay}, attempt={backoff_attempt})")
+            return delay
+        
+        # request_delay가 0이면 기본 지수 백오프 (10, 20, 40초)
+        delay = 10 * (2 ** backoff_attempt)
         # 최대 300초(5분)로 제한
         delay = min(delay, 300)
         self._logger.info(f"Using exponential backoff: {delay}s (attempt {backoff_attempt})")
