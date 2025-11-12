@@ -183,6 +183,15 @@ Before you finalize your response, double-check that the entire output is a sing
             self._logger.info(f"trial {trial} finished")
 
     def _translate_chunk(self, chunk: list[LineData], chunk_index: int, save_path: str, original_path: str):
+        """
+        청크를 번역합니다.
+        
+        재시도 전략:
+        1. 지수 백오프 3회 시도 (request_delay * 2^attempt)
+        2. 3회 실패 시 키 로테이션
+        3. 모든 키 순환할 때까지 반복
+        4. 최종 실패 시 실패 상태 반환
+        """
         is_suceed: bool = True
         
         ## Load Contents For Gemini ##
@@ -190,32 +199,70 @@ Before you finalize your response, double-check that the entire output is a sing
             llm_contents = f.read()
         self._logger.info(f"Load Gemini Contents From {original_path}\n")
 
-        ## Translation ##
-        translated_lines = []
-        for i in range(3):
-            try:
-                self._logger.info(f"Chunk{chunk_index} Translation (Try {i+1})")
-                response_text = self._core.generate_content(llm_contents)
-                translated_lines = response_text.splitlines(keepends=True)
-                if len(translated_lines) != len(chunk) or re.sub(r'^\[\d+\]\s*', '', translated_lines[-1]).strip() == "":
-                    self._logger.info(
-                        f"Failed To Parse Translated Response Of Chunk{chunk_index} (Try {i+1})\n" + \
-                        "len(loaded_lines)={}, len(chunk)={} {}".format(len(translated_lines), len(chunk), re.sub(r'^[\d+]\s*', '', translated_lines[-1] if translated_lines else "No line found").strip())
+        total_keys = self._core.get_keys_count()
+        max_keys_to_try = total_keys if total_keys > 0 else 1
+        
+        for key_index in range(max_keys_to_try):
+            # 각 키마다 지수 백오프 3회 시도
+            for backoff_attempt in range(3):
+                translated_lines = []
+                try:
+                    self._logger.info(f"Chunk{chunk_index} Translation (Key {key_index}, Backoff {backoff_attempt})")
+                    response_text = self._core.generate_content(llm_contents)
+                    translated_lines = response_text.splitlines(keepends=True)
+                    
+                    if len(translated_lines) != len(chunk) or re.sub(r'^\[\d+\]\s*', '', translated_lines[-1]).strip() == "":
+                        self._logger.info(
+                            f"Failed To Parse Translated Response Of Chunk{chunk_index} (Key {key_index}, Backoff {backoff_attempt})\n" + \
+                            "len(loaded_lines)={}, len(chunk)={} {}".format(
+                                len(translated_lines), len(chunk), 
+                                re.sub(r'^[\d+]\s*', '', translated_lines[-1] if translated_lines else "No line found").strip()
+                            )
                         )
-                    if i == 2:
-                        self._logger.warning(f"Final Failiure In Chunk{chunk_index} Translation")
-                        is_suceed = False
-                    continue
+                        if backoff_attempt >= 2 and key_index >= max_keys_to_try - 1:
+                            self._logger.warning(f"Final Failure In Chunk{chunk_index} Translation")
+                            is_suceed = False
+                        continue
 
-                ## Update Chunk's Translated Fields ##
-                for i, line in enumerate(translated_lines):
-                    chunk[i].translated = self._restore_repeat_tags(re.sub(r'^\[\d+\]\s*', '', line).strip())
-                self._logger.info(f"Updated Chunks[{chunk_index}] Data")
-                time.sleep(self._request_delay)
-                return is_suceed, chunk_index
-            except Exception as e:
-                self._logger.exception(str(e))
-                continue
+                    ## Update Chunk's Translated Fields ##
+                    for i, line in enumerate(translated_lines):
+                        chunk[i].translated = self._restore_repeat_tags(re.sub(r'^\[\d+\]\s*', '', line).strip())
+                    self._logger.info(f"Successfully translated Chunk[{chunk_index}]")
+                    time.sleep(self._request_delay)
+                    return is_suceed, chunk_index
+                    
+                except Exception as e:
+                    error_str = str(e)
+                    
+                    # 429 (Rate Limit) 또는 503 (Server Unavailable) 에러 처리
+                    if "429" in error_str or "Resource exhausted" in error_str or "503" in error_str or "UNAVAILABLE" in error_str:
+                        error_type = "Rate Limit (429)" if ("429" in error_str or "Resource exhausted" in error_str) else "Server Unavailable (503)"
+                        
+                        # 지수 백오프 3회 시도
+                        if backoff_attempt < 2:  # 0, 1일 때만 재시도 (총 3회)
+                            delay = self._calculate_backoff_delay(backoff_attempt, error_str)
+                            self._logger.info(f"{error_type} - Backoff attempt {backoff_attempt + 1}/3, waiting {delay}s")
+                            time.sleep(delay)
+                            continue
+                        else:
+                            # 3회 실패 후 키 로테이션 시도
+                            if key_index < max_keys_to_try - 1:
+                                if self._core.rotate_to_next_key():
+                                    self._logger.info(f"Exhausted 3 backoff attempts ({error_type}). Rotating to next key ({key_index + 1}/{max_keys_to_try})")
+                                    break  # 내부 루프 탈출하여 다음 키로
+                                else:
+                                    self._logger.error("Failed to rotate key")
+                            else:
+                                self._logger.error(f"All keys exhausted with 3 backoff attempts each ({error_type})")
+                    else:
+                        self._logger.exception(f"Non-429 error at key {key_index}, attempt {backoff_attempt}: {e}")
+                        if backoff_attempt < 2:
+                            continue
+                        else:
+                            break  # 다른 에러는 3회 시도 후 포기
+        
+        self._logger.error(f"Final failure for Chunk[{chunk_index}] after trying all keys")
+        return False, chunk_index
         
     
     def _apply_repeat_tags(self, text: str, min_repeat: int = 4, max_unit_len: int = 10) -> str:
@@ -285,12 +332,11 @@ Before you finalize your response, double-check that the entire output is a sing
         retry_seconds = 0
 
         try:
-            # JSON이 아니라 Python dict처럼 생긴 문자열이므로 literal_eval 사용
             err_data = ast.literal_eval(dict_str)
             details = err_data.get("error", {}).get("details", [])
             for detail in details:
                 if detail.get("@type") == "type.googleapis.com/google.rpc.RetryInfo":
-                    retry_str = detail.get("retryDelay", "")  # 예: "39s"
+                    retry_str = detail.get("retryDelay", "")
                     match = re.match(r"(\d+)s", retry_str)
                     if match:
                         retry_seconds = int(match.group(1))
@@ -299,35 +345,106 @@ Before you finalize your response, double-check that the entire output is a sing
             self._logger.warning(f"retryDelay 파싱 실패: {e}")
             return 10
 
-        return retry_seconds + extra_seconds if retry_seconds > 0 else 0
+        return retry_seconds + extra_seconds if retry_seconds > 0 else 10
+    
+    def _calculate_backoff_delay(self, backoff_attempt: int, error_str: str = "") -> int:
+        """
+        지수 백오프 딜레이를 계산합니다.
+        API 응답에 retryDelay가 있으면 우선 사용하고, 없으면 지수 백오프 적용.
+        
+        Args:
+            backoff_attempt: 현재 백오프 시도 횟수 (0부터 시작)
+            error_str: API 에러 메시지 (retryDelay 파싱용)
+        
+        Returns:
+            int: 대기 시간 (초). 최대 300초(5분)로 제한.
+        """
+        # API 응답에서 retryDelay 추출 시도 (429, 503 모두)
+        if error_str and (
+            "429" in error_str or "Resource exhausted" in error_str or 
+            "503" in error_str or "UNAVAILABLE" in error_str
+        ):
+            api_delay = self._parse_retry_delay_from_error(error_str)
+            if api_delay > 0:
+                self._logger.info(f"Using API retryDelay: {api_delay}s")
+                return api_delay
+        
+        # 지수 백오프: request_delay * (2 ^ attempt)
+        delay = self._request_delay * (2 ** backoff_attempt)
+        # 최대 300초(5분)로 제한
+        delay = min(delay, 300)
+        self._logger.info(f"Using exponential backoff: {delay}s (attempt {backoff_attempt})")
+        return delay
 
     def _translate_text_dict_chunk(self, chunk: dict[int, str], chunk_index: int):
+        """
+        텍스트 딕셔너리 청크를 번역합니다.
+        
+        재시도 전략:
+        1. 지수 백오프 3회 시도 (request_delay * 2^attempt)
+        2. 3회 실패 시 키 로테이션
+        3. 모든 키 순환할 때까지 반복
+        4. 최종 실패 시 빈 딕셔너리 반환
+        """
         is_suceed: bool = True
         translated_text_dict = {}
         llm_contents = json.dumps(chunk, ensure_ascii=False, indent=2)
-        self._logger.info(f"Load Gemini Contents")
+        self._logger.info(f"Load Gemini Contents for Chunk {chunk_index}")
 
-        for i in range(3):
-            try:
-                self._logger.info(f"Chunk{chunk_index} Translation (Try {i+1})")
-                resp = self._core.generate_content(llm_contents)
-                translated_text_dict: dict = json.loads(resp)
-                if translated_text_dict.keys() != chunk.keys():
-                    self._logger.info(f"Failed To Parse Translated Response Of Chunk{chunk_index} (Try {i+1})\n")
-                    if i == 2:
-                        self._logger.warning(f"Final Failiure In Chunk{chunk_index} Translation")
-                        is_suceed = False
-                    continue
-                self._logger.info(f"Updated Chunks[{chunk_index}] Data")
-                time.sleep(self._request_delay)
-                return is_suceed, chunk_index, translated_text_dict
+        total_keys = self._core.get_keys_count()
+        max_keys_to_try = total_keys if total_keys > 0 else 1
+        
+        for key_index in range(max_keys_to_try):
+            # 각 키마다 지수 백오프 3회 시도
+            for backoff_attempt in range(3):
+                resp = ""
+                try:
+                    self._logger.info(f"Chunk{chunk_index} Translation (Key {key_index}, Backoff {backoff_attempt})")
+                    resp = self._core.generate_content(llm_contents)
+                    translated_text_dict: dict = json.loads(resp)
+                    
+                    if translated_text_dict.keys() != chunk.keys():
+                        self._logger.info(f"Failed To Parse Translated Response Of Chunk{chunk_index} (Key {key_index}, Backoff {backoff_attempt})\n")
+                        if backoff_attempt >= 2 and key_index >= max_keys_to_try - 1:
+                            self._logger.warning(f"Final Failure In Chunk{chunk_index} Translation")
+                            is_suceed = False
+                        continue
+                        
+                    self._logger.info(f"Successfully translated Chunk[{chunk_index}]")
+                    time.sleep(self._request_delay)
+                    return is_suceed, chunk_index, translated_text_dict
 
-            except Exception as e:
-                if resp:
-                    self._logger.info(f"##### ORIGINAL #####\n\n{str(llm_contents)}\n\n##### RESPONSE #####\n\n{str(resp)}\n")
-                self._logger.exception(str(e))
-                if i < 2:
-                    continue
-                else:
-                    return False, chunk_index, {}
+                except Exception as e:
+                    error_str = str(e)
+                    if resp:
+                        self._logger.info(f"##### ORIGINAL #####\n\n{str(llm_contents)}\n\n##### RESPONSE #####\n\n{str(resp)}\n")
+                    
+                    # 429 (Rate Limit) 또는 503 (Server Unavailable) 에러 처리
+                    if "429" in error_str or "Resource exhausted" in error_str or "503" in error_str or "UNAVAILABLE" in error_str:
+                        error_type = "Rate Limit (429)" if ("429" in error_str or "Resource exhausted" in error_str) else "Server Unavailable (503)"
+                        
+                        # 지수 백오프 3회 시도
+                        if backoff_attempt < 2:  # 0, 1일 때만 재시도 (총 3회)
+                            delay = self._calculate_backoff_delay(backoff_attempt, error_str)
+                            self._logger.info(f"{error_type} - Backoff attempt {backoff_attempt + 1}/3, waiting {delay}s")
+                            time.sleep(delay)
+                            continue
+                        else:
+                            # 3회 실패 후 키 로테이션 시도
+                            if key_index < max_keys_to_try - 1:
+                                if self._core.rotate_to_next_key():
+                                    self._logger.info(f"Exhausted 3 backoff attempts ({error_type}). Rotating to next key ({key_index + 1}/{max_keys_to_try})")
+                                    break  # 내부 루프 탈출하여 다음 키로
+                                else:
+                                    self._logger.error("Failed to rotate key")
+                            else:
+                                self._logger.error(f"All keys exhausted with 3 backoff attempts each ({error_type})")
+                    else:
+                        self._logger.exception(f"Non-429 error at key {key_index}, attempt {backoff_attempt}: {e}")
+                        if backoff_attempt < 2:
+                            continue
+                        else:
+                            break  # 다른 에러는 3회 시도 후 포기
+        
+        self._logger.error(f"Final failure for Chunk[{chunk_index}] after trying all keys")
         return False, chunk_index, {}

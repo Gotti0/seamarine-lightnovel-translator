@@ -195,10 +195,19 @@ Before you finalize your response, double-check that the entire output is a sing
         self.completed.emit(save_path)
 
     def _translate_text_dict_chunk(self, chunk: dict[int, str], chunk_index: int):
+        """
+        텍스트 딕셔너리 청크를 번역합니다.
+        
+        재시도 전략:
+        1. 지수 백오프 3회 시도 (request_delay * 2^attempt)
+        2. 3회 실패 시 키 로테이션
+        3. 모든 키 순환할 때까지 반복
+        4. 최종 실패 시 빈 딕셔너리 반환
+        """
         is_suceed: bool = True
         translated_text_dict = {}
         llm_contents = json.dumps(chunk, ensure_ascii=False, indent=2)
-        self._logger.info(f"Load Gemini Contents")
+        self._logger.info(f"Load Gemini Contents for Chunk {chunk_index}")
 
         schema = {
             "type": "object",
@@ -208,24 +217,55 @@ Before you finalize your response, double-check that the entire output is a sing
             "required": [str(key) for key in chunk.keys()]
         }
 
-        for i in range(3):
-            resp = ""
-            try:
-                self._logger.info(f"Chunk{chunk_index} Translation (Try {i+1})")
-                resp = self._core.generate_content(llm_contents, resp_in_json=True, schema=schema)
-                translated_text_dict: dict = json.loads(resp)
-                self._logger.info(f"Updated Chunks[{chunk_index}] Data")
-                time.sleep(self._request_delay)
-                return is_suceed, chunk_index, translated_text_dict
+        total_keys = self._core.get_keys_count()
+        max_keys_to_try = total_keys if total_keys > 0 else 1
+        
+        for key_index in range(max_keys_to_try):
+            # 각 키마다 지수 백오프 3회 시도
+            for backoff_attempt in range(3):
+                resp = ""
+                try:
+                    self._logger.info(f"Chunk{chunk_index} Translation (Key {key_index}, Backoff {backoff_attempt})")
+                    resp = self._core.generate_content(llm_contents, resp_in_json=True, schema=schema)
+                    translated_text_dict: dict = json.loads(resp)
+                    self._logger.info(f"Successfully translated Chunk[{chunk_index}]")
+                    time.sleep(self._request_delay)
+                    return is_suceed, chunk_index, translated_text_dict
 
-            except Exception as e:
-                if resp:
-                    self._logger.info(f"##### ORIGINAL #####\n\n{str(llm_contents)}\n\n##### RESPONSE #####\n\n{str(resp)}\n")
-                self._logger.exception(str(e))
-                if i < 2:
-                    continue
-                else:
-                    return False, chunk_index, {}
+                except Exception as e:
+                    error_str = str(e)
+                    if resp:
+                        self._logger.info(f"##### ORIGINAL #####\n\n{str(llm_contents)}\n\n##### RESPONSE #####\n\n{str(resp)}\n")
+                    
+                    # 429 (Rate Limit) 또는 503 (Server Unavailable) 에러 처리
+                    if "429" in error_str or "Resource exhausted" in error_str or "503" in error_str or "UNAVAILABLE" in error_str:
+                        error_type = "Rate Limit (429)" if ("429" in error_str or "Resource exhausted" in error_str) else "Server Unavailable (503)"
+                        
+                        # 지수 백오프 3회 시도
+                        if backoff_attempt < 2:  # 0, 1일 때만 재시도 (총 3회)
+                            delay = self._calculate_backoff_delay(backoff_attempt, error_str)
+                            self._logger.info(f"{error_type} - Backoff attempt {backoff_attempt + 1}/3, waiting {delay}s")
+                            time.sleep(delay)
+                            continue
+                        else:
+                            # 3회 실패 후 키 로테이션 시도
+                            if key_index < max_keys_to_try - 1:
+                                if self._core.rotate_to_next_key():
+                                    self._logger.info(f"Exhausted 3 backoff attempts ({error_type}). Rotating to next key ({key_index + 1}/{max_keys_to_try})")
+                                    break  # 내부 루프 탈출하여 다음 키로
+                                else:
+                                    self._logger.error("Failed to rotate key")
+                            else:
+                                self._logger.error(f"All keys exhausted with 3 backoff attempts each ({error_type})")
+                    else:
+                        self._logger.exception(f"Non-429 error at key {key_index}, attempt {backoff_attempt}: {e}")
+                        if backoff_attempt < 2:
+                            time.sleep(5)
+                            continue
+                        else:
+                            break  # 다른 에러는 3회 시도 후 포기
+        
+        self._logger.error(f"Final failure for Chunk[{chunk_index}] after trying all keys with exponential backoff")
         return False, chunk_index, {}
     
     def _apply_repeat_tags(self, text: str, min_repeat: int = 4, max_unit_len: int = 10) -> str:
@@ -283,25 +323,29 @@ Before you finalize your response, double-check that the entire output is a sing
     
     def _parse_retry_delay_from_error(self, error, extra_seconds=2) -> int:
         """
-        주어진 에러 메시지에서 재시도 지연시간(초)을 추출합니다.
-        에러 메시지에 "retry after <숫자>" 형태가 있다면 해당 숫자를 반환하고,
-        그렇지 않으면 기본값 10초를 반환합니다.
+        API 에러 응답에서 retryDelay를 파싱합니다.
+        
+        Args:
+            error: 에러 객체 또는 문자열
+            extra_seconds: retryDelay에 추가할 버퍼 시간 (초)
+        
+        Returns:
+            int: 대기해야 할 시간 (초). 파싱 실패 시 10초 반환.
         """
         error_str = str(error)
         start_idx = error_str.find('{')
         if start_idx == -1:
-            return 0  # JSON 부분 없음
+            return 10
         
         dict_str = error_str[start_idx:]
         retry_seconds = 0
 
         try:
-            # JSON이 아니라 Python dict처럼 생긴 문자열이므로 literal_eval 사용
             err_data = ast.literal_eval(dict_str)
             details = err_data.get("error", {}).get("details", [])
             for detail in details:
                 if detail.get("@type") == "type.googleapis.com/google.rpc.RetryInfo":
-                    retry_str = detail.get("retryDelay", "")  # 예: "39s"
+                    retry_str = detail.get("retryDelay", "")
                     match = re.match(r"(\d+)s", retry_str)
                     if match:
                         retry_seconds = int(match.group(1))
@@ -310,4 +354,33 @@ Before you finalize your response, double-check that the entire output is a sing
             self._logger.warning(f"retryDelay 파싱 실패: {e}")
             return 10
 
-        return retry_seconds + extra_seconds if retry_seconds > 0 else 0
+        return retry_seconds + extra_seconds if retry_seconds > 0 else 10
+    
+    def _calculate_backoff_delay(self, backoff_attempt: int, error_str: str = "") -> int:
+        """
+        지수 백오프 딜레이를 계산합니다.
+        API 응답에 retryDelay가 있으면 우선 사용하고, 없으면 지수 백오프 적용.
+        
+        Args:
+            backoff_attempt: 현재 백오프 시도 횟수 (0부터 시작)
+            error_str: API 에러 메시지 (retryDelay 파싱용)
+        
+        Returns:
+            int: 대기 시간 (초). 최대 300초(5분)로 제한.
+        """
+        # API 응답에서 retryDelay 추출 시도 (429, 503 모두)
+        if error_str and (
+            "429" in error_str or "Resource exhausted" in error_str or 
+            "503" in error_str or "UNAVAILABLE" in error_str
+        ):
+            api_delay = self._parse_retry_delay_from_error(error_str)
+            if api_delay > 0:
+                self._logger.info(f"Using API retryDelay: {api_delay}s")
+                return api_delay
+        
+        # 지수 백오프: request_delay * (2 ^ attempt)
+        delay = self._request_delay * (2 ** backoff_attempt)
+        # 최대 300초(5분)로 제한
+        delay = min(delay, 300)
+        self._logger.info(f"Using exponential backoff: {delay}s (attempt {backoff_attempt})")
+        return delay

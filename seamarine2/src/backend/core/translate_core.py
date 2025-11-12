@@ -60,8 +60,16 @@ class TranslateCore:
             self._logger.error(str(self) + str(e))
             return []
         
-    def _rotate_key(self) -> bool:
-        if not self._keys:
+    def rotate_to_next_key(self) -> bool:
+        """
+        다음 API 키로 로테이션합니다.
+        Worker가 429 에러 처리 시 명시적으로 호출합니다.
+        
+        Returns:
+            bool: 로테이션 성공 여부 (키가 1개 이하면 False)
+        """
+        if not self._keys or len(self._keys) <= 1:
+            self._logger.warning("Cannot rotate: insufficient keys")
             return False
         
         self._current_key_index = (self._current_key_index + 1) % len(self._keys)
@@ -70,8 +78,27 @@ class TranslateCore:
         self._client = genai.Client()
         self._logger.info(f"Rotated to key index {self._current_key_index}")
         return True
+    
+    def has_more_keys(self) -> bool:
+        """로테이션 가능한 키가 있는지 확인"""
+        return len(self._keys) > 1
+    
+    def get_keys_count(self) -> int:
+        """등록된 전체 키 개수 반환"""
+        return len(self._keys)
+    
+    def get_current_key_index(self) -> int:
+        """현재 사용 중인 키의 인덱스 반환"""
+        return self._current_key_index
 
-    def generate_content(self, contents: str | bytes, divide_n_conquer = True, resp_in_json = False, level: int = 0, retry_count: int = 0, schema: dict = None):
+    def generate_content(self, contents: str | bytes, divide_n_conquer = True, resp_in_json = False, level: int = 0, schema: dict = None):
+        """
+        Gemini API를 호출하여 콘텐츠를 생성합니다.
+        
+        Note:
+            429 에러는 더 이상 여기서 처리하지 않고 상위 레이어(Worker)로 전파됩니다.
+            Worker 레이어에서 재시도 전략(지수 백오프, 키 로테이션)을 결정합니다.
+        """
         try:
             gen_config = types.GenerateContentConfig(
                 max_output_tokens= 65536 if '2.5' in self._model_data.name else 8192,
@@ -124,12 +151,22 @@ class TranslateCore:
             return self._clean_gemini_response(resp.text)
         except Exception as e:
             self._logger.error(f"{str(self)}.generate_content -> {str(e)}")
-            if ("429" in str(e) or "Resource exhausted" in str(e)) and retry_count < len(self._keys):
-                self._logger.info(f"429/Resource Exhausted Detected. Rotating API key.")
-                self._rotate_key()
-                return self.generate_content(contents, divide_n_conquer, resp_in_json, level, retry_count + 1)
+            # 400, 500 에러는 divide and conquer로 처리
+            if ("400" in str(e) or "INVALID_ARGUMENT" in str(e)):
+                self._logger.warning(f"400 INVALID_ARGUMENT detected. Attempting divide and conquer.")
+                if divide_n_conquer:
+                    return self._divide_and_conquer_json(contents, level=level, schema=schema) if resp_in_json else self._divide_and_conquer(contents, level=level)
+                else:
+                    return ""
+            elif ("500" in str(e) or "INTERNAL" in str(e)):
+                self._logger.warning(f"500 INTERNAL error detected. Attempting divide and conquer.")
+                if divide_n_conquer:
+                    return self._divide_and_conquer_json(contents, level=level, schema=schema) if resp_in_json else self._divide_and_conquer(contents, level=level)
+                else:
+                    return ""
             else:
-                return ""
+                # 429 및 기타 모든 에러는 상위로 전파
+                raise
         
     def count_token(self, text):
         return self._client.models.count_tokens(text)
@@ -172,7 +209,7 @@ class TranslateCore:
         for i in range(3):
             try:
                 self._logger.info(f"Processing first half... (level {level + 1}, chunk 1, attempt {i})")
-                subresp_1 = self.generate_content(subcontents_1, resp_in_json=True, level=level+1, retry_count=0, schema=schema1)
+                subresp_1 = self.generate_content(subcontents_1, resp_in_json=True, level=level+1, schema=schema1)
                 subdict_1.update(json.loads(subresp_1))
                 self._logger.debug(f"Response from first half: {subresp_1}")
                 break
@@ -182,7 +219,7 @@ class TranslateCore:
         for i in range(3):
             try:
                 self._logger.info(f"Processing second half... (level {level + 1}, chunk 2, attempt {i})")
-                subresp_2 = self.generate_content(subcontents_2, resp_in_json=True, level=level+1, retry_count=0, schema=schema2)
+                subresp_2 = self.generate_content(subcontents_2, resp_in_json=True, level=level+1, schema=schema2)
                 subdict_2.update(json.loads(subresp_2))
                 self._logger.debug(f"Response from second half: {subresp_2}")
                 break
