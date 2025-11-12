@@ -215,11 +215,23 @@ class TranslateCore:
                 break
             except Exception as e:
                 error_str = str(e)
-                # 429/503 에러는 Worker 레벨에서 처리하도록 즉시 전파
-                if "429" in error_str or "Resource exhausted" in error_str or "503" in error_str or "UNAVAILABLE" in error_str:
-                    self._logger.warning(f"429/503 error in divide_and_conquer (first half), propagating to worker level")
+                # 503 에러는 divide_and_conquer 내부에서 재시도
+                if "503" in error_str or "UNAVAILABLE" in error_str:
+                    if i < 2:  # 재시도 가능
+                        delay = 30 * (2 ** i)  # 30초, 60초, (120초는 시도 안함)
+                        self._logger.warning(f"503 UNAVAILABLE in divide_and_conquer (first half), retrying after {delay}s (attempt {i+1}/3)")
+                        time.sleep(delay)
+                        continue
+                    else:
+                        # 3번 실패하면 worker로 전파
+                        self._logger.error("503 persists after 3 retries in divide_and_conquer (first half)")
+                        raise
+                # 429 에러는 Worker 레벨에서 처리하도록 즉시 전파
+                elif "429" in error_str or "Resource exhausted" in error_str:
+                    self._logger.warning(f"429 error in divide_and_conquer (first half), propagating to worker level")
                     raise
-                self._logger.exception(f"Failed to divide and conquer in json, retry...({i})")
+                # 기타 에러는 3회 재시도
+                self._logger.exception(f"Failed to divide and conquer in json (first half), retry...({i})")
                 if i == 2:  # 마지막 시도에서도 실패하면 전파
                     raise
                 continue
@@ -232,11 +244,23 @@ class TranslateCore:
                 break
             except Exception as e:
                 error_str = str(e)
-                # 429/503 에러는 Worker 레벨에서 처리하도록 즉시 전파
-                if "429" in error_str or "Resource exhausted" in error_str or "503" in error_str or "UNAVAILABLE" in error_str:
-                    self._logger.warning(f"429/503 error in divide_and_conquer (second half), propagating to worker level")
+                # 503 에러는 divide_and_conquer 내부에서 재시도
+                if "503" in error_str or "UNAVAILABLE" in error_str:
+                    if i < 2:  # 재시도 가능
+                        delay = 30 * (2 ** i)  # 30초, 60초, (120초는 시도 안함)
+                        self._logger.warning(f"503 UNAVAILABLE in divide_and_conquer (second half), retrying after {delay}s (attempt {i+1}/3)")
+                        time.sleep(delay)
+                        continue
+                    else:
+                        # 3번 실패하면 worker로 전파
+                        self._logger.error("503 persists after 3 retries in divide_and_conquer (second half)")
+                        raise
+                # 429 에러는 Worker 레벨에서 처리하도록 즉시 전파
+                elif "429" in error_str or "Resource exhausted" in error_str:
+                    self._logger.warning(f"429 error in divide_and_conquer (second half), propagating to worker level")
                     raise
-                self._logger.exception(f"Failed to divide and conquer in json, retry...({i})")
+                # 기타 에러는 3회 재시도
+                self._logger.exception(f"Failed to divide and conquer in json (second half), retry...({i})")
                 if i == 2:  # 마지막 시도에서도 실패하면 전파
                     raise
                 continue
