@@ -214,7 +214,14 @@ class TranslateCore:
                 self._logger.debug(f"Response from first half: {subresp_1}")
                 break
             except Exception as e:
+                error_str = str(e)
+                # 429/503 에러는 Worker 레벨에서 처리하도록 즉시 전파
+                if "429" in error_str or "Resource exhausted" in error_str or "503" in error_str or "UNAVAILABLE" in error_str:
+                    self._logger.warning(f"429/503 error in divide_and_conquer (first half), propagating to worker level")
+                    raise
                 self._logger.exception(f"Failed to divide and conquer in json, retry...({i})")
+                if i == 2:  # 마지막 시도에서도 실패하면 전파
+                    raise
                 continue
         for i in range(3):
             try:
@@ -224,7 +231,14 @@ class TranslateCore:
                 self._logger.debug(f"Response from second half: {subresp_2}")
                 break
             except Exception as e:
+                error_str = str(e)
+                # 429/503 에러는 Worker 레벨에서 처리하도록 즉시 전파
+                if "429" in error_str or "Resource exhausted" in error_str or "503" in error_str or "UNAVAILABLE" in error_str:
+                    self._logger.warning(f"429/503 error in divide_and_conquer (second half), propagating to worker level")
+                    raise
                 self._logger.exception(f"Failed to divide and conquer in json, retry...({i})")
+                if i == 2:  # 마지막 시도에서도 실패하면 전파
+                    raise
                 continue
 
 
