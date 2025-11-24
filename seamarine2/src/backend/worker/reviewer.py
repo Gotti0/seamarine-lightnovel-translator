@@ -330,9 +330,20 @@ Before you finalize your response, double-check that the entire output is a sing
         
         dict_str = error_str[start_idx:]
         retry_seconds = 0
+        err_data = {}
 
         try:
-            err_data = ast.literal_eval(dict_str)
+            # 1. Try json.loads first (standard JSON)
+            err_data = json.loads(dict_str)
+        except json.JSONDecodeError:
+            # 2. If failed, try ast.literal_eval (Python dict string)
+            try:
+                err_data = ast.literal_eval(dict_str)
+            except Exception as e:
+                self._logger.warning(f"retryDelay 파싱 실패: {e}")
+                return 0
+
+        try:
             details = err_data.get("error", {}).get("details", [])
             for detail in details:
                 if detail.get("@type") == "type.googleapis.com/google.rpc.RetryInfo":
@@ -342,7 +353,7 @@ Before you finalize your response, double-check that the entire output is a sing
                         retry_seconds = int(match.group(1))
                         break
         except Exception as e:
-            self._logger.warning(f"retryDelay 파싱 실패: {e}")
+            self._logger.warning(f"retryDelay 데이터 추출 실패: {e}")
             return 0
 
         return retry_seconds + extra_seconds if retry_seconds > 0 else 0
