@@ -145,139 +145,23 @@ class PnExtractor(QThread):
             text = text[:-3].strip()
         self._logger.info(str(self) + f"._clean_response() ->")
         return text
-
-    def _get_retry_delay_from_exception(self, error_str: str, extra_seconds: int = 2) -> int:
-        """
-        API 에러 응답에서 retryDelay를 파싱합니다.
-        
-        Args:
-            error_str: 에러 메시지 문자열
-            extra_seconds: retryDelay에 추가할 버퍼 시간 (초)
-        
-        Returns:
-            int: 대기해야 할 시간 (초). 파싱 실패 시 10초 반환.
-        """
-        start_idx = error_str.find('{')
-        if start_idx == -1:
-            return 10
-        
-        dict_str = error_str[start_idx:]
-        retry_seconds = 0
-
-        try:
-            err_data = ast.literal_eval(dict_str)
-            details = err_data.get("error", {}).get("details", [])
-            for detail in details:
-                if detail.get("@type") == "type.googleapis.com/google.rpc.RetryInfo":
-                    retry_str = detail.get("retryDelay", "")
-                    match = re.match(r"(\d+)s", retry_str)
-                    if match:
-                        retry_seconds = int(match.group(1))
-                        break
-        except Exception as e:
-            self._logger.warning(f"Failed to parse retryDelay: {e}")
-            return 0
-
-        return retry_seconds + extra_seconds if retry_seconds > 0 else 0
-    
-    def _calculate_backoff_delay(self, backoff_attempt: int, error_str: str = "") -> int:
-        """
-        지수 백오프 딜레이를 계산합니다.
-        API 응답에 retryDelay가 있으면 우선 사용하고, 없으면 지수 백오프 적용.
-        
-        Args:
-            backoff_attempt: 현재 백오프 시도 횟수 (0부터 시작)
-            error_str: API 에러 메시지 (retryDelay 파싱용)
-        
-        Returns:
-            int: 대기 시간 (초). 최대 300초(5분)로 제한.
-        """
-        # API 응답에서 retryDelay 추출 시도 (429, 503 모두)
-        if error_str and (
-            "429" in error_str or "Resource exhausted" in error_str or 
-            "503" in error_str or "UNAVAILABLE" in error_str
-        ):
-            api_delay = self._get_retry_delay_from_exception(error_str)
-            if api_delay > 0:
-                self._logger.info(f"Using API retryDelay: {api_delay}s")
-                return api_delay
-        
-        # API에서 retryDelay가 없으면 request_delay 기반 지수 백오프 사용
-        if self._request_delay > 0:
-            # 지수 백오프: request_delay * (2 ^ attempt)
-            delay = self._request_delay * (2 ** backoff_attempt)
-            # 최대 300초(5분)로 제한
-            delay = min(delay, 300)
-            self._logger.info(f"Using exponential backoff: {delay}s (request_delay={self._request_delay}, attempt={backoff_attempt})")
-            return delay
-        
-        # request_delay가 0이면 기본 지수 백오프 (10, 20, 40초)
-        delay = 10 * (2 ** backoff_attempt)
-        # 최대 300초(5분)로 제한
-        delay = min(delay, 300)
-        self._logger.info(f"Using exponential backoff: {delay}s (attempt {backoff_attempt})")
-        return delay
     
     def _process_chunk(self, chunk):
         """
         청크를 처리하여 고유명사를 추출합니다.
-        
-        재시도 전략:
-        1. 지수 백오프 3회 시도 (request_delay * 2^attempt)
-        2. 3회 실패 시 키 로테이션
-        3. 모든 키 순환할 때까지 반복
-        4. 최종 실패 시 빈 딕셔너리 반환
         """
-        total_keys = self._core.get_keys_count()
-        max_keys_to_try = total_keys if total_keys > 0 else 1
-        
-        for key_index in range(max_keys_to_try):
-            # 각 키마다 지수 백오프 3회 시도
-            for backoff_attempt in range(3):
-                try:
-                    response = self._core.generate_content(chunk, True, True)
-                    if response:
-                        cleaned = self._clean_response(response.strip())
-                        self._logger.info(cleaned)
-                        new_dict = json.loads(cleaned)
-                    else:
-                        new_dict = {}
-
-                    time.sleep(self._request_delay)
-                    self._logger.info(f"Successfully processed chunk (key {key_index}, attempt {backoff_attempt})")
-                    return new_dict
-
-                except Exception as e:
-                    error_str = str(e)
-                    
-                    # 429 (Rate Limit) 또는 503 (Server Unavailable) 에러 처리
-                    if "429" in error_str or "Resource exhausted" in error_str or "503" in error_str or "UNAVAILABLE" in error_str:
-                        error_type = "Rate Limit (429)" if ("429" in error_str or "Resource exhausted" in error_str) else "Server Unavailable (503)"
-                        
-                        # 지수 백오프 3회 시도
-                        if backoff_attempt < 2:  # 0, 1일 때만 재시도 (총 3회)
-                            delay = self._calculate_backoff_delay(backoff_attempt, error_str)
-                            self._logger.info(f"{error_type} - Backoff attempt {backoff_attempt + 1}/3, waiting {delay}s")
-                            time.sleep(delay)
-                            continue
-                        else:
-                            # 3회 실패 후 키 로테이션 시도
-                            if key_index < max_keys_to_try - 1:
-                                if self._core.rotate_to_next_key():
-                                    self._logger.info(f"Exhausted 3 backoff attempts ({error_type}). Rotating to next key ({key_index + 1}/{max_keys_to_try})")
-                                    break  # 내부 루프 탈출하여 다음 키로
-                                else:
-                                    self._logger.error("Failed to rotate key")
-                            else:
-                                self._logger.error(f"All keys exhausted with 3 backoff attempts each ({error_type})")
-                    else:
-                        self._logger.error(f"Non-429 error at key {key_index}, attempt {backoff_attempt}: {e}")
-                        time.sleep(5)
-                        if backoff_attempt >= 2:
-                            break  # 다른 에러는 3회 시도 후 포기
-
-        self._logger.error("Final failure after trying all keys with exponential backoff. Returning empty dict.")
-        return {}
+        try:
+            # TranslateCore handles retries and key rotation internally
+            response = self._core.generate_content(chunk, True, True, retry_delay=self._request_delay)
+            if response:
+                cleaned = self._clean_response(response.strip())
+                self._logger.info(cleaned)
+                return json.loads(cleaned)
+            else:
+                return {}
+        except Exception as e:
+            self._logger.error(f"Failed to process chunk after all retries: {e}")
+            return {}
 
     def _save_to_csv(self):
         try:

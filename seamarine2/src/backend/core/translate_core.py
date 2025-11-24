@@ -91,90 +91,166 @@ class TranslateCore:
         """현재 사용 중인 키의 인덱스 반환"""
         return self._current_key_index
 
-    def generate_content(self, contents: str | bytes, divide_n_conquer = True, resp_in_json = False, level: int = 0, schema: dict = None):
+    def _parse_retry_delay_from_error(self, error, extra_seconds=2) -> int:
+        """
+        API 에러 응답에서 retryDelay를 파싱합니다.
+        """
+        error_str = str(error)
+        retry_seconds = 0
+        
+        pattern = r'["\']?retryDelay["\']?\s*:\s*["\']?(\d+(?:\.\d+)?)[sS]?["\']?'
+        
+        try:
+            match = re.search(pattern, error_str)
+            if match:
+                val = float(match.group(1))
+                retry_seconds = int(val)
+                self._logger.info(f"Found retryDelay in error message: {retry_seconds}s")
+        except Exception as e:
+            self._logger.warning(f"retryDelay 정규식 추출 실패: {e}")
+            return 0
+
+        return retry_seconds + extra_seconds if retry_seconds > 0 else 0
+
+    def _calculate_backoff_delay(self, backoff_attempt: int, error_str: str = "", base_delay: int = 10) -> int:
+        """
+        지수 백오프 딜레이를 계산합니다.
+        """
+        if error_str:
+            api_delay = self._parse_retry_delay_from_error(error_str)
+            if api_delay > 0:
+                self._logger.info(f"Using API retryDelay: {api_delay}s")
+                return api_delay
+        
+        delay = base_delay * (2 ** backoff_attempt)
+        delay = min(delay, 300)
+        
+        self._logger.info(f"Using exponential backoff: {delay}s (attempt {backoff_attempt})")
+        return delay
+
+    def generate_content(self, contents: str | bytes, divide_n_conquer = True, resp_in_json = False, level: int = 0, schema: dict = None, retry_delay: int = 10):
         """
         Gemini API를 호출하여 콘텐츠를 생성합니다.
-        
-        Note:
-            429 에러는 더 이상 여기서 처리하지 않고 상위 레이어(Worker)로 전파됩니다.
-            Worker 레이어에서 재시도 전략(지수 백오프, 키 로테이션)을 결정합니다.
+        내부적으로 재시도 및 키 로테이션을 수행합니다.
         """
-        try:
-            gen_config = types.GenerateContentConfig(
-                max_output_tokens= 65536 if '2.5' in self._model_data.name else 8192,
-                system_instruction= self._model_data.system_prompt,
-                temperature= self._model_data.temperature,
-                top_p= self._model_data.top_p,
-                frequency_penalty= self._model_data.frequency_penalty,
-                safety_settings = [
-                    types.SafetySetting(
-                        category=types.HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT,
-                        threshold=types.HarmBlockThreshold.OFF
-                    ),
-                    types.SafetySetting(
-                        category=types.HarmCategory.HARM_CATEGORY_HATE_SPEECH,
-                        threshold=types.HarmBlockThreshold.OFF
-                    ),
-                    types.SafetySetting(
-                        category=types.HarmCategory.HARM_CATEGORY_HARASSMENT,
-                        threshold=types.HarmBlockThreshold.OFF
-                    ),
-                    types.SafetySetting(
-                        category=types.HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT,
-                        threshold=types.HarmBlockThreshold.OFF
-                    ),
-                    types.SafetySetting(
-                        category=types.HarmCategory.HARM_CATEGORY_CIVIC_INTEGRITY,
-                        threshold=types.HarmBlockThreshold.OFF
+        # API 호출 전 딜레이 적용 (재귀 호출 시에도 적용됨)
+        if retry_delay > 0:
+            time.sleep(retry_delay)
+
+        total_keys = self.get_keys_count()
+        max_keys_to_try = total_keys if total_keys > 0 else 1
+        last_exception = None
+
+        for key_attempt in range(max_keys_to_try):
+            for attempt in range(3):
+                try:
+                    gen_config = types.GenerateContentConfig(
+                        max_output_tokens= 65536 if '2.5' in self._model_data.name else 8192,
+                        system_instruction= self._model_data.system_prompt,
+                        temperature= self._model_data.temperature,
+                        top_p= self._model_data.top_p,
+                        frequency_penalty= self._model_data.frequency_penalty,
+                        safety_settings = [
+                            types.SafetySetting(
+                                category=types.HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT,
+                                threshold=types.HarmBlockThreshold.OFF
+                            ),
+                            types.SafetySetting(
+                                category=types.HarmCategory.HARM_CATEGORY_HATE_SPEECH,
+                                threshold=types.HarmBlockThreshold.OFF
+                            ),
+                            types.SafetySetting(
+                                category=types.HarmCategory.HARM_CATEGORY_HARASSMENT,
+                                threshold=types.HarmBlockThreshold.OFF
+                            ),
+                            types.SafetySetting(
+                                category=types.HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT,
+                                threshold=types.HarmBlockThreshold.OFF
+                            ),
+                            types.SafetySetting(
+                                category=types.HarmCategory.HARM_CATEGORY_CIVIC_INTEGRITY,
+                                threshold=types.HarmBlockThreshold.OFF
+                            )
+                        ],
                     )
-                ],
-            )
-            if self._model_data.use_thinking_budget:
-                gen_config.thinking_config = types.ThinkingConfig(thinking_budget=self._model_data.thinking_budget)
+                    if self._model_data.use_thinking_budget:
+                        gen_config.thinking_config = types.ThinkingConfig(thinking_budget=self._model_data.thinking_budget)
 
-            if resp_in_json and schema:
-                gen_config.response_mime_type = "application/json"
-                gen_config.response_json_schema = schema
+                    if resp_in_json and schema:
+                        gen_config.response_mime_type = "application/json"
+                        gen_config.response_json_schema = schema
+                    
+                    resp = self._client.models.generate_content(
+                        model=self._model_data.name,
+                        contents=contents,
+                        config=gen_config
+                    )
+
+                    if resp.prompt_feedback and resp.prompt_feedback.block_reason:
+                        self._logger.warning(f"Response blocked with the reason {resp.prompt_feedback.block_reason}")
+                        if divide_n_conquer and isinstance(contents, str):
+                            return self._divide_and_conquer_json(contents, level=level, schema=schema, retry_delay=retry_delay) if resp_in_json else self._divide_and_conquer(contents, level=level, retry_delay=retry_delay)
+                        else:
+                            return ""
+                    
+                    return self._clean_gemini_response(resp.text)
+
+                except Exception as e:
+                    last_exception = e
+                    error_str = str(e)
+                    error_lower = error_str.lower()
+                    self._logger.error(f"{str(self)}.generate_content -> {error_str}")
+
+                    # 429, 503 등 재시도 필요한 에러
+                    is_rate_limit = "429" in error_str or "resource exhausted" in error_lower or "quota" in error_lower
+                    is_server_error = "503" in error_str or "unavailable" in error_lower
+                    
+                    if is_rate_limit or is_server_error:
+                        if attempt < 2:
+                            delay = self._calculate_backoff_delay(attempt, error_str, retry_delay)
+                            time.sleep(delay)
+                            continue
+                        # 3회 실패 시 루프 종료하고 키 로테이션으로 넘어감
+
+                    # 400, 500 에러는 divide and conquer로 처리 (단, 503 제외)
+                    # 500 INTERNAL은 일시적일 수 있으나 기존 로직 유지하여 divide and conquer 시도
+                    elif ("400" in error_str or "INVALID_ARGUMENT" in error_str or "500" in error_str or "INTERNAL" in error_str):
+                        self._logger.warning(f"400/500 error detected. Attempting divide and conquer.")
+                        if divide_n_conquer and isinstance(contents, str):
+                            return self._divide_and_conquer_json(contents, level=level, schema=schema, retry_delay=retry_delay) if resp_in_json else self._divide_and_conquer(contents, level=level, retry_delay=retry_delay)
+                        else:
+                            return ""
+                    
+                    else:
+                        # 기타 에러
+                        if attempt < 2:
+                            time.sleep(retry_delay)
+                            continue
             
-            resp = self._client.models.generate_content(
-                model=self._model_data.name,
-                contents=contents,
-                config=gen_config
-            )
-
-            if resp.prompt_feedback and resp.prompt_feedback.block_reason:
-                self._logger.warning(f"Response blocked with the reason {resp.prompt_feedback.block_reason}")
-                if divide_n_conquer:
-                    return self._divide_and_conquer_json(contents, level=level, schema=schema) if resp_in_json else self._divide_and_conquer(contents, level=level)
+            # 현재 키에서 3회 실패함. 다음 키로 로테이션 시도
+            if key_attempt < max_keys_to_try - 1:
+                if self.rotate_to_next_key():
+                    self._logger.info(f"Rotating to next key due to failure (Attempt {key_attempt + 1}/{max_keys_to_try})")
+                    continue
                 else:
-                    return ""
-            return self._clean_gemini_response(resp.text)
-        except Exception as e:
-            self._logger.error(f"{str(self)}.generate_content -> {str(e)}")
-            # 400, 500 에러는 divide and conquer로 처리
-            if ("400" in str(e) or "INVALID_ARGUMENT" in str(e)):
-                self._logger.warning(f"400 INVALID_ARGUMENT detected. Attempting divide and conquer.")
-                if divide_n_conquer:
-                    return self._divide_and_conquer_json(contents, level=level, schema=schema) if resp_in_json else self._divide_and_conquer(contents, level=level)
-                else:
-                    return ""
-            elif ("500" in str(e) or "INTERNAL" in str(e)):
-                self._logger.warning(f"500 INTERNAL error detected. Attempting divide and conquer.")
-                if divide_n_conquer:
-                    return self._divide_and_conquer_json(contents, level=level, schema=schema) if resp_in_json else self._divide_and_conquer(contents, level=level)
-                else:
-                    return ""
-            else:
-                # 429 및 기타 모든 에러는 상위로 전파
-                raise
+                    self._logger.error("Failed to rotate key")
+                    break
+        
+        # 모든 키 시도 실패
+        raise last_exception
         
     def count_token(self, text):
         return self._client.models.count_tokens(text)
     
 
-    def _divide_and_conquer_json(self, contents: str, level: int = 0, schema: dict = None) -> str:
+    def _divide_and_conquer_json(self, contents: str, level: int = 0, schema: dict = None, retry_delay: int = 10) -> str:
         self._logger.info(f"Start divide and conquer in json at level {level}")
-        json_dict = json.loads(contents)
+        try:
+            json_dict = json.loads(contents)
+        except json.JSONDecodeError:
+            self._logger.warning("Failed to parse JSON in divide_and_conquer_json. Falling back to plain text divide and conquer.")
+            return self._divide_and_conquer(contents, level, retry_delay)
+
         keys = list(json_dict.keys())
         mid = len(keys) // 2
         first_half = {k: json_dict[k] for k in keys[:mid]}
@@ -206,82 +282,68 @@ class TranslateCore:
 
         subdict_1 = {}
         subdict_2 = {}
-        for i in range(3):
-            try:
-                self._logger.info(f"Processing first half... (level {level + 1}, chunk 1, attempt {i})")
-                subresp_1 = self.generate_content(subcontents_1, resp_in_json=True, level=level+1, schema=schema1)
-                subdict_1.update(json.loads(subresp_1))
-                self._logger.debug(f"Response from first half: {subresp_1}")
-                break
-            except Exception as e:
-                error_str = str(e)
-                # 503 에러는 divide_and_conquer 내부에서 재시도
-                if "503" in error_str or "UNAVAILABLE" in error_str:
-                    if i < 2:  # 재시도 가능
-                        delay = 30 * (2 ** i)  # 30초, 60초, (120초는 시도 안함)
-                        self._logger.warning(f"503 UNAVAILABLE in divide_and_conquer (first half), retrying after {delay}s (attempt {i+1}/3)")
-                        time.sleep(delay)
-                        continue
-                    else:
-                        # 3번 실패하면 worker로 전파
-                        self._logger.error("503 persists after 3 retries in divide_and_conquer (first half)")
-                        raise
-                # 429 에러는 Worker 레벨에서 처리하도록 즉시 전파
-                elif "429" in error_str or "Resource exhausted" in error_str:
-                    self._logger.warning(f"429 error in divide_and_conquer (first half), propagating to worker level")
-                    raise
-                # 기타 에러는 3회 재시도
-                self._logger.exception(f"Failed to divide and conquer in json (first half), retry...({i})")
-                if i == 2:  # 마지막 시도에서도 실패하면 전파
-                    raise
-                continue
-        for i in range(3):
-            try:
-                self._logger.info(f"Processing second half... (level {level + 1}, chunk 2, attempt {i})")
-                subresp_2 = self.generate_content(subcontents_2, resp_in_json=True, level=level+1, schema=schema2)
-                subdict_2.update(json.loads(subresp_2))
-                self._logger.debug(f"Response from second half: {subresp_2}")
-                break
-            except Exception as e:
-                error_str = str(e)
-                # 503 에러는 divide_and_conquer 내부에서 재시도
-                if "503" in error_str or "UNAVAILABLE" in error_str:
-                    if i < 2:  # 재시도 가능
-                        delay = 30 * (2 ** i)  # 30초, 60초, (120초는 시도 안함)
-                        self._logger.warning(f"503 UNAVAILABLE in divide_and_conquer (second half), retrying after {delay}s (attempt {i+1}/3)")
-                        time.sleep(delay)
-                        continue
-                    else:
-                        # 3번 실패하면 worker로 전파
-                        self._logger.error("503 persists after 3 retries in divide_and_conquer (second half)")
-                        raise
-                # 429 에러는 Worker 레벨에서 처리하도록 즉시 전파
-                elif "429" in error_str or "Resource exhausted" in error_str:
-                    self._logger.warning(f"429 error in divide_and_conquer (second half), propagating to worker level")
-                    raise
-                # 기타 에러는 3회 재시도
-                self._logger.exception(f"Failed to divide and conquer in json (second half), retry...({i})")
-                if i == 2:  # 마지막 시도에서도 실패하면 전파
-                    raise
-                continue
+        
+        try:
+            self._logger.info(f"Processing first half... (level {level + 1})")
+            subresp_1 = self.generate_content(subcontents_1, resp_in_json=True, level=level+1, schema=schema1, retry_delay=retry_delay)
+            subdict_1.update(json.loads(subresp_1))
+            self._logger.debug(f"Response from first half: {subresp_1}")
+        except Exception as e:
+            self._logger.error(f"Failed to process first half in divide_and_conquer: {e}")
+            raise
 
+        try:
+            self._logger.info(f"Processing second half... (level {level + 1})")
+            subresp_2 = self.generate_content(subcontents_2, resp_in_json=True, level=level+1, schema=schema2, retry_delay=retry_delay)
+            subdict_2.update(json.loads(subresp_2))
+            self._logger.debug(f"Response from second half: {subresp_2}")
+        except Exception as e:
+            self._logger.error(f"Failed to process second half in divide_and_conquer: {e}")
+            raise
 
-        merged_dict = {}
-        merged_dict.update(subdict_1)
-        merged_dict.update(subdict_2)
+        merged_dict = subdict_1.copy()
+        for k, v in subdict_2.items():
+            if k in merged_dict and merged_dict[k] != v:
+                self._logger.warning(f"Duplicate key '{k}' detected during merge in divide_and_conquer_json. Overwriting '{merged_dict[k]}' with '{v}'")
+            merged_dict[k] = v
+            
         self._logger.debug(f"Merged dict: {merged_dict}")
 
         self._logger.info(f"End divide and conquer in json at level {level}")
         return json.dumps(merged_dict)
     
-    def _divide_and_conquer(self, contents: str, level: int = 0) -> str:
+    def _divide_and_conquer(self, contents: str, level: int = 0, retry_delay: int = 10) -> str:
         self._logger.info(f"Start divide and conquer at level {level}")
         subcontents_1 = contents[0:len(contents)//2]
         subcontents_2 = contents[len(contents)//2:len(contents)]
 
+        try:
+            resp1 = self.generate_content(subcontents_1, level=level+1, retry_delay=retry_delay)
+        except Exception as e:
+            self._logger.error(f"Failed to process first half in divide_and_conquer: {e}")
+            raise
 
+        try:
+            resp2 = self.generate_content(subcontents_2, level=level+1, retry_delay=retry_delay)
+        except Exception as e:
+            self._logger.error(f"Failed to process second half in divide_and_conquer: {e}")
+            raise
 
-        
+        # JSON 응답인 경우 병합 시도
+        try:
+            json1 = json.loads(resp1)
+            json2 = json.loads(resp2)
+            if isinstance(json1, dict) and isinstance(json2, dict):
+                merged = json1.copy()
+                for k, v in json2.items():
+                    if k in merged and merged[k] != v:
+                        self._logger.warning(f"Duplicate key '{k}' detected during merge in divide_and_conquer. Overwriting '{merged[k]}' with '{v}'")
+                    merged[k] = v
+                return json.dumps(merged, ensure_ascii=False)
+        except json.JSONDecodeError:
+            pass
+
+        return resp1 + resp2
 
 
     def _clean_gemini_response(self, response_text: str) -> str:
